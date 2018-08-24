@@ -1,0 +1,1522 @@
+---
+title: "HCI010_Seurate_2.1_Analysis_TPM"
+author: "Ryan Davis"
+date: "January 25, 2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Load in Dataset
+
+Going to be working with the expected counts matrix in the new Seurat 2.0 version and run the built in normalization pipeline from their tutorial.
+
+```{r dataset_import}
+set.seed(1)
+p10.mat<-read.table("E:\\Annotated_RNAseq_Libraries\\UntrimmedFPKM\\HCI010_combinedmatrix.geneIDensemblID_FPKM_HCI010label.txt",header=TRUE,row.names = 1)
+rows<-strsplit(rownames(p10.mat),":E")
+rows<-unlist(rows)
+rows<-rows[c(TRUE,FALSE)]
+rows<-make.unique(rows)
+rownames(p10.mat)<-rows
+p10.mat <- sweep(p10.mat,2,colSums(p10.mat),'/')*(10^6) #convert fpkm values to tpm
+#p10.mat=log(p10.mat+1) #log transform data
+```
+
+## Load Packages
+
+```{r load_libraries}
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(MAST)
+library(pheatmap)
+library(ape)
+library(reshape2)
+```
+#
+# Initialize Seurat Object and Add Meta Data
+
+Run the first few commands of the Seurat 2.0 pipeline <http://satijalab.org/seurat/p103k_tutorial.html>. This will create the intial Seurat Object. Add meta data for mouse, tissue, and burden
+
+```{r initialize_seurat}
+p10 <- CreateSeuratObject(raw.data = p10.mat, min.cells = 8, min.genes = 1000, 
+    project = "HCI010")
+#The % of UMI mapping to MT-genes is a common scRNA-seq QC metric.  NOTE: You must have the Matrix package loaded to calculate the percent.mito values.
+mito.genes <- grep(pattern = "^MT-", x = rownames(x = p10@data), value = TRUE)
+percent.mito <- colSums(p10@data[mito.genes, ])/colSums(p10@data)
+# AddMetaData adds columns to object@data.info, and is a great place to stash QC stats
+p10 <- AddMetaData(object = p10, metadata = percent.mito, col.name = "percent.mito")
+#Mouse
+cols<-colnames(p10@raw.data)
+mouse.0<-strsplit(cols, "_")
+mouse.1<-matrix(nrow=length(cols),ncol=1)
+rownames(mouse.1)<-cols
+for (i in 1:length(cols)){
+  mouse.1[i,1]<-mouse.0[[i]][2]
+}
+p10 <- AddMetaData(p10, mouse.1, "mouse")
+#Burden
+cols<-colnames(p10@raw.data)
+burden.0<-strsplit(cols, "_")
+burden.1<-matrix(nrow=length(cols),ncol=1)
+rownames(burden.1)<-cols
+for (i in 1:length(cols)){
+  burden.1[i,1]<-burden.0[[i]][3]
+}
+p10 <- AddMetaData(p10, burden.1, "burden")
+#Tissue
+cols<-colnames(p10@raw.data)
+tissue.0<-strsplit(cols, "_")
+tissue.1<-matrix(nrow=length(cols),ncol=1)
+rownames(tissue.1)<-cols
+for (i in 1:length(cols)){
+  tissue.1[i,1]<-tissue.0[[i]][4]
+}
+p10 <- AddMetaData(p10, tissue.1, "tissue")
+```
+
+## Quality Control
+
+Ran QC metrics for nGene, nUMI, and percent.mito. OVerall, all datasets are oddly strong on all fronts, with an average nGene count at around 5-6k across mouse, tissue, and burden. The percent.mito is low in most all cells, which is actually somewhat inconsistent with earlier analysis of TPM based measures. I am going to be setting a hard cut-off at 0.3 for percent mito and 2500 for nGene for this dataset, which seems to best describe the outlier populations for this patient cells.
+
+```{r quality_control, echo=FALSE}
+#The number of genes and UMIs (nGene and nUMI) are automatically calculated for every object by Seurat.  For non-UMI data, nUMI represents the sum of the non-normalized values within a cell We calculate the percentage of mitochondrial genes here and store it in percent.mito using AddMetaData. We use object@raw.data since this represents non-transformed and non-log-normalized counts.
+VlnPlot(object = p10, features.plot = c("nGene", "nUMI", "percent.mito"), nCol = 3,group.by = "mouse")
+VlnPlot(object = p10, features.plot = c("nGene", "nUMI", "percent.mito"), nCol = 3,group.by = "tissue")
+VlnPlot(object = p10, features.plot = c("nGene", "nUMI", "percent.mito"), nCol = 3,group.by = "burden")
+par(mfrow = c(1, 2))
+GenePlot(object = p10, gene1 = "nGene", gene2 = "percent.mito")
+GenePlot(object = p10, gene1 = "nUMI", gene2 = "nGene")
+p10 <- FilterCells(object = p10, subset.names = c("nGene", "percent.mito"), 
+    low.thresholds = c(2500, -Inf), high.thresholds = c(Inf, 0.5))
+```
+
+##Normalize Data and Generate Highly Variable Genes (hvg)
+
+The parameters here identify 5053 variable genes
+
+```{r normalize_hvg}
+p10 <- NormalizeData(p10)
+p10 <- FindVariableGenes(object = p10, mean.function = ExpMean, dispersion.function = LogVMR, 
+    x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5)
+length(p10@var.genes)
+```
+##Scale Data and Regress
+
+Your single cell dataset likely contains 'uninteresting' sources of variation. This could include not only technical noise, but batch effects, or even biological sources of variation (cell cycle stage). As suggested in Buettner et al, NBT, 2015, regressing these signals out of the analysis can improve downstream dimensionality reduction and clustering. To mitigate the effect of these signals, Seurat constructs linear models to predict gene expression based on user-defined variables. The scaled z-scored residuals of these models are stored in the scale.data slot, and are used for dimensionality reduction and clustering.
+
+For this, I have chosen to on nUMI and percent.mito at this stage. If I see evidence of cell cycle complications downstream in dimentionality reduction, I will re-run and following the cell cycle vignette
+
+```{r scale_regress, echo=FALSE}
+p10 <- ScaleData(object = p10, vars.to.regress = c("nGene", "percent.mito"),display.progress = FALSE)
+```
+
+##Dimentionality Reduction
+
+In PCA space, it seems like PC1 is seperating by mets and tumors, which is fantastic. Consistent with our previous TPM analysis, the major drivers of variation in the first dataset deal largely with extracellular matrix composition, in COL1A2, COL3A1, and MMP2. On the PCElbowPlot, I chose to use PCs 1:15 for tSNE., as this is about when the variance starts to plateu. This generates a seperate population for low burden LU and LN mets, and a seperate population of L and I burden mets, along with 3 tumor populations, including 1 which involves the high burden mets.
+
+```{r dimentionality_reduction_PCA}
+p10 <- RunPCA(object = p10, pc.genes = p10@var.genes, do.print = TRUE, pcs.print = 1:5, 
+    genes.print = 5)
+n1<-PCAPlot(object = p10, dim.1 = 1, dim.2 = 2, group.by="mouse",do.return=TRUE)
+n2<-PCAPlot(object = p10, dim.1 = 1, dim.2 = 2, group.by="tissue",do.return=TRUE)
+n3<-PCAPlot(object = p10, dim.1 = 1, dim.2 = 2, group.by="burden",do.return=TRUE)
+m1<-PCAPlot(object = p10, dim.1 = 3, dim.2 = 4, group.by="mouse",do.return=TRUE)
+m2<-PCAPlot(object = p10, dim.1 = 3, dim.2 = 4, group.by="tissue",do.return=TRUE)
+m3<-PCAPlot(object = p10, dim.1 = 3, dim.2 = 4, group.by="burden",do.return=TRUE)
+plot_grid(n1,n2,n3)
+plot_grid(m1,m2,m3)
+PCElbowPlot(object = p10,num.pc = 20)
+```
+```{r dimentionality_reduction_tSNE}
+set.seed(1)
+#p10 <- FindClusters(object = p10, reduction.type = "pca", dims.use = 1:15, 
+    #resolution = 1.0, print.output = 0, save.SNN = TRUE)
+p10 <- FindClusters(object = p10, reduction.type = "pca", dims.use = 1:5, 
+    resolution = 1.0, print.output = 0, save.SNN = TRUE)
+PrintFindClustersParams(object = p10)
+set.seed(1)
+#p10 <- RunTSNE(object = p10, dims.use = 1:15, do.fast = TRUE)
+p10 <- RunTSNE(object = p10, dims.use = 1:5, do.fast = TRUE)
+h1<-TSNEPlot(p10,do.label = TRUE, group.by="res.1",do.return=TRUE)
+h2<-TSNEPlot(p10,do.label = FALSE, group.by="mouse",do.return=TRUE)
+h3<-TSNEPlot(p10,do.label = FALSE, group.by="tissue",do.return=TRUE)
+h4<-TSNEPlot(p10,do.label = TRUE, group.by="burden",do.return=TRUE)
+plot_grid(h1,h2,h3,h4)
+```
+## Marker Gene Identification
+
+```{r markers_identification}
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+p10.markers <- FindAllMarkers(object = p10, only.pos = TRUE, test.use = "bimod")
+top10 <- p10.markers %>% group_by(cluster) %>% top_n(10, avg_logFC)
+# setting slim.col.label to TRUE will print just the cluster IDS instead of every cell name
+DoHeatmap(object = p10, genes.use = top10$gene, slim.col.label = TRUE, 
+    remove.key = TRUE,cex.row = 6)
+#write.table(p10.markers,file="E:\\Marker_Lists\\112717_Update_Marker_Genes\\012418_HCI010_ClusterMarkers_Res1.0_5PCs.txt",sep="\t",col.names = TRUE, row.names = FALSE)
+```
+## Look at Cell Cycle States
+
+```{r cell_cycle}
+g1s.genes <- read.table(file= "E:\\Gene_Lists\\G1.S_genes.txt",header = TRUE)
+which(g1s.genes[,1] %in% rownames(p10@data))->keep.g1s
+g1s.genes<-g1s.genes[keep.g1s,]
+g2m.genes <- read.table(file= "E:\\Gene_Lists\\G2.M_genes.txt",header = TRUE)
+which(g2m.genes[,1] %in% rownames(p10@data))->keep.g2m
+g2m.genes<-g2m.genes[keep.g2m,]
+p10.cc <- CellCycleScoring(object = p10, s.genes = g1s.genes, g2m.genes = g2m.genes, 
+    set.ident = TRUE)
+p10.cc<-SetAllIdent(p10.cc, id="old.ident")
+GenePlot(p10.cc,"S.Score","G2M.Score", do.identify = T)
+```
+```{r scale_cell_cycle}
+p10.cc <- ScaleData(object = p10.cc, vars.to.regress = c("nGene","percent.mito","S.Score","G2M.Score"), display.progress = FALSE)
+p10.cc <- RunPCA(object = p10.cc, pc.genes = p10.cc@var.genes, genes.print = 10)
+x1<-PCAPlot(object = p10.cc, do.return=TRUE)
+x2<-PCAPlot(object = p10.cc, do.return=TRUE, group.by="old.ident")
+plot_grid(x1,x2)
+PCElbowPlot(object = p10.cc,num.pc = 20)
+```
+
+## Cell Cycle Plot with KI67 Expression
+
+```{r cc_plot_ki67}
+p10@meta.data<-cbind(p10@meta.data, p10.cc@meta.data$S.Score)
+p10@meta.data<-cbind(p10@meta.data, p10.cc@meta.data$G2M.Score)
+
+gene.plot.1 = "p10.cc@meta.data$S.Score"
+gene.plot.2 = "p10.cc@meta.data$G2M.Score"
+double.pos.plotting.matrix<-cbind.data.frame(p10@meta.data[,which(colnames(p10@meta.data)==gene.plot.1)],p10@meta.data[,which(colnames(p10@meta.data)==gene.plot.2)],p10@meta.data$res.1)
+colnames(double.pos.plotting.matrix)<-c(gene.plot.1,gene.plot.2,"Identity")
+p<-ggplot(double.pos.plotting.matrix,aes(x=get(gene.plot.1),y=get(gene.plot.2)))
+#p + geom_point(aes(color = Identity),size=1.0) + theme(legend.position="none")
+p + geom_point(aes(color = Identity),size=1.0)
+
+gene.plot.1 = "S.Score"
+gene.plot.2 = "G2M.Score"
+double.pos.plotting.matrix<-cbind.data.frame(p10.cc@meta.data[,which(colnames(p10.cc@meta.data)==gene.plot.1)],p10.cc@meta.data[,which(colnames(p10.cc@meta.data)==gene.plot.2)],p10.cc@meta.data$res.1)
+colnames(double.pos.plotting.matrix)<-c(gene.plot.1,gene.plot.2,"Identity")
+q<-ggplot(double.pos.plotting.matrix,aes(x=get(gene.plot.1),y=get(gene.plot.2)))
+#q + geom_point(aes(color = Identity),size=1.0) + theme(legend.position="none")
+q + geom_point(aes(color = Identity),size=1)
+
+ki67.exp<-FetchData(p10.cc, "MKI67")
+ki67.scaled<-FetchData(p10.cc, "MKI67", use.scaled=TRUE)
+cc.plot.mat<-cbind.data.frame(p10.cc@meta.data$S.Score, p10.cc@meta.data$G2M.Score, p10.cc@meta.data$named.clusters,ki67.exp,ki67.scaled)
+colnames(cc.plot.mat)<-c("G1S.Score", "G2M.Score", "Cluster", "KI67.Expression", "Scaled.KI67")
+#cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=Cluster))+
+cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=KI67.Expression))+
+    #scale_color_gradient(low="blue", high="red")+
+#cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=Scaled.KI67))+
+  scale_color_gradient(low="grey", high="red")+
+  geom_point(size=1.0)+
+  geom_vline(xintercept=0)+
+  geom_hline(yintercept=0)+
+  #theme(legend.position="none")
+cc.plot
+GenePlot(p10.cc, "S.Score","G2M.Score")
+```
+
+##Cell Cycle Group Membership Quantification
+
+```{r cc_group_membership}
+p10.cc.noncycling<-SubsetData(p10.cc,subset.name = "S.Score", accept.high = 0, accept.low = -Inf)
+p10.cc.noncycling<-SubsetData(p10.cc.noncycling,subset.name = "G2M.Score", accept.high = 0, accept.low = -Inf)
+postclust0.nocycle<-grep("0", p10.cc.noncycling@meta.data$res.1)
+postclust1.nocycle<-grep("1", p10.cc.noncycling@meta.data$res.1)
+postclust2.nocycle<-grep("2", p10.cc.noncycling@meta.data$res.1)
+postclust3.nocycle<-grep("3", p10.cc.noncycling@meta.data$res.1)
+postclust4.nocycle<-grep("4", p10.cc.noncycling@meta.data$res.1)
+postclust5.nocycle<-grep("5", p10.cc.noncycling@meta.data$res.1)
+postclust0.all<-grep("0", p10.cc@meta.data$res.1)
+postclust1.all<-grep("1", p10.cc@meta.data$res.1)
+postclust2.all<-grep("2", p10.cc@meta.data$res.1)
+postclust3.all<-grep("3", p10.cc@meta.data$res.1)
+postclust4.all<-grep("4", p10.cc@meta.data$res.1)
+postclust5.all<-grep("5", p10.cc@meta.data$res.1)
+
+p10.noncycling<-SubsetData(p10,subset.name = "p10.cc@meta.data$S.Score", accept.high = 0, accept.low = -Inf)
+p10.noncycling<-SubsetData(p10.noncycling,subset.name = "p10.cc.meta.data.G2M.Score", accept.high = 0, accept.low = -Inf)
+preclust0.nocycle<-grep("0", p10.noncycling@meta.data$res.1)
+preclust1.nocycle<-grep("1", p10.noncycling@meta.data$res.1)
+preclust2.nocycle<-grep("2", p10.noncycling@meta.data$res.1)
+preclust3.nocycle<-grep("3", p10.noncycling@meta.data$res.1)
+preclust4.nocycle<-grep("4", p10.noncycling@meta.data$res.1)
+preclust0.all<-grep("0", p10@meta.data$res.1)
+preclust1.all<-grep("1", p10@meta.data$res.1)
+preclust2.all<-grep("2", p10@meta.data$res.1)
+preclust3.all<-grep("3", p10@meta.data$res.1)
+preclust4.all<-grep("4", p10@meta.data$res.1)
+```
+
+## Run Dimentionality Reduction on Cell Cycle Regressed Data
+
+```{r dim_reduce_cc}
+set.seed(1)
+#p10.cc <- FindClusters(object = p10.cc, reduction.type = "pca", dims.use = 1:15, 
+    #resolution = 1.0, print.output = 0, save.SNN = TRUE)
+p10.cc <- FindClusters(object = p10.cc, reduction.type = "pca", dims.use = 1:5, 
+    resolution = 1.0, print.output = 0, save.SNN = TRUE, force.recalc = TRUE)
+PrintFindClustersParams(object = p10.cc)
+set.seed(1)
+#p10.cc <- RunTSNE(object = p10.cc, dims.use = 1:15, do.fast = TRUE)
+p10.cc <- RunTSNE(object = p10.cc, dims.use = 1:5, do.fast = TRUE)
+h1.cc<-TSNEPlot(p10.cc,do.label = TRUE, group.by="res.1",do.return=TRUE)
+h2.cc<-TSNEPlot(p10.cc,do.label = FALSE, group.by="mouse",do.return=TRUE)
+h3.cc<-TSNEPlot(p10.cc,do.label = FALSE, group.by="tissue",do.return=TRUE)
+h4.cc<-TSNEPlot(p10.cc,do.label = TRUE, group.by="burden",do.return=TRUE)
+plot_grid(h1.cc,h2.cc,h3.cc,h4.cc)
+```
+
+## Marker Genes on Cell Cycle Regressed Data
+
+Combined Clusters 0 and 1 into a single clusters since they don't appear to be different enough to represent unique subpopulations.
+
+```{r rename_clusters_type}
+p10.cc<-SetAllIdent(p10.cc,id="res.1")
+p10.cc<-RenameIdent(p10.cc,old.ident.name = "0",new.ident.name = "High/Tumor")
+p10.cc<-RenameIdent(p10.cc,old.ident.name = "1",new.ident.name = "Tumor 1")
+p10.cc<-RenameIdent(p10.cc,old.ident.name = "2",new.ident.name = "Tumor 2")
+p10.cc<-RenameIdent(p10.cc,old.ident.name = "3",new.ident.name = "Low")
+p10.cc<-RenameIdent(p10.cc,old.ident.name = "4",new.ident.name = "Low/Int")
+p10.cc<-RenameIdent(p10.cc,old.ident.name = "5",new.ident.name = "Tumor 3")
+p10.cc@ident<-factor(p10.cc@ident,levels(p10.cc@ident)[c(4,5,1,2,3,6)])
+p10.cc<-StashIdent(p10.cc,save.name = "named.clusters")
+```
+
+```{r table_cluster_rep}
+p10.cc<-SetAllIdent(p10.cc, id="named.clusters")
+table(p10.cc@ident, p10.cc@meta.data$tissue)
+```
+
+
+```{r find_markers_heatmap_cc}
+p10.cc<-SetAllIdent(p10.cc,id="named.clusters")
+p10.cc.markers <- FindAllMarkers(object = p10.cc, only.pos = TRUE, test.use = "bimod")
+top50.p10 <- p10.cc.markers %>% group_by(cluster) %>% top_n(50, avg_logFC)
+# setting slim.col.label to TRUE will print just the cluster IDS instead of every cell name
+pdf(file="E:\\Plots\\RO1_Grant\\HCI010_ClusterID_Heatmap_Top50_DE_Genes.pdf", 18,9)
+DoHeatmap(object = p10.cc, genes.use = top50.p10$gene, slim.col.label = TRUE, 
+    remove.key = TRUE,cex.row = 1)
+```
+```{r write_markers_cc}
+write.table(p10.cc.markers,file="E:\\Marker_Lists\\012518_Seurat2.1_UpdatedMarkerGenes\\HCI010_ClusterMarkers_5PCs_Custom_Res1.0_cc.txt",sep="\t",col.names = TRUE, row.names = FALSE)
+```
+```{r find_markers_burden_cc}
+p10.cc <- SetAllIdent(p10.cc, id = "burden")
+p10.cc.markers.metvtum <- FindAllMarkers(object = p10.cc, only.pos = TRUE, test.use = "bimod")
+top100 <- p10.cc.markers.metvtum %>% group_by(cluster) %>% top_n(100, p_val)
+dev.new()
+pdf(file="E:\\Plots\\RO1_Grant\\HCI010_MetvTum_Heatmap_Top100_DE_Genes.pdf", 18,9)
+DoHeatmap(object = p10.cc, genes.use = top100$gene, slim.col.label = TRUE, 
+    remove.key = TRUE,cex.row = 3)
+```
+```{r write_markers_burden_cc}
+write.table(p10.cc.markers.metvtum,file="E:\\Marker_Lists\\012518_Seurat2.1_UpdatedMarkerGenes\\HCI010_ClusterMarkers_5PCs_MetvTum_cc.txt",sep="\t",col.names = TRUE, row.names = FALSE)
+```
+
+## Save Seurat Object
+
+```{r save_seurat}
+#save(p10,file="E:\\Scripts\\Seurat\\012518_Seurat2.1_SeuratObjects\\HCI010_Seurat2.1_Object.Rda")
+save(p10.cc,file="E:\\Scripts\\Seurat\\012518_Seurat2.1_SeuratObjects\\HCI010_Seurat2.1_CellCycle_Object.Rda")
+```
+
+## Load Seurat Object
+
+```{r load_seurat}
+load(file="E:\\Scripts\\Seurat\\012518_Seurat2.1_SeuratObjects\\HCI010_Seurat2.1_Object.Rda")
+load(file="E:\\Scripts\\Seurat\\012518_Seurat2.1_SeuratObjects\\HCI010_Seurat2.1_CellCycle_Object.Rda")
+```
+
+##TRAIL Apoptosis Genes
+
+```{r trail_apoptosis_genes}
+genes<-read.delim("E:\\Gene_Lists\\TRAIL_Mediated_Apoptosis_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+pdf("E:\\Plots\\HCI010_TRAIL_ApoptosisGenes_Burden.pdf", 12,6)
+DotPlot(p10.cc, genes, group.by = "burden", x.lab.rot = T, plot.legend = T, cols.use = c("lightgrey","red"), dot.scale = 25, dot.min = 0.1)
+pdf("E:\\Plots\\HCI010_TRAIL_ApoptosisGenes_Burden_VlnPlots.pdf", 16,12)
+VlnPlot(p10.cc, genes, group.by = "burden")
+pdf("E:\\Plots\\HCI010_TRAIL_ApoptosisGenes_Burden_FeaturePlots.pdf", 16,12)
+FeaturePlot(p10.cc, genes,cols.use = c("lightgrey","red"))
+#JoyPlot(p10.cc, genes, group.by = "burden")
+#FeatureHeatmap(p10.cc, genes, group.by = "burden")
+DotPlot(p10.cc, "BAG3", group.by = "burden", dot.scale = 30)
+```
+
+##Proteasome Genes
+
+```{r proteasome_genes}
+genes<-read.delim("E:\\Gene_Lists\\Proteasome_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+genes.subset<-genes[which(genes %in% c("PSMG3", "PSMG1", "PSMC3", "PSMD3", "PSMD14", "PSMB2", "PSMB7", "PSMA4", "PSMD6"))]
+
+meta.data<-data.frame(row.names = rownames(p10.cc@meta.data))
+meta.data[,1]<-p10.cc@meta.data$named.clusters
+meta.data[,2]<-p10.cc@meta.data$burden
+colnames(meta.data)<-c("Cluster_ID","Type")
+col.ann.colors=list(Cluster_ID=c("Low"= "#f8766d","Low/Int"="#b79f00","Tumor 1"="#00ba38","Tumor 2"="#00bfc4","Tumor 3"="#619cff","High/Tumor"="#f564e3"),Type=c("H"="#f8766d","I"="#7cae00","L"="#00bfc4","T"="#c77cff"))
+
+pheatmap(p10.cc@data[genes.subset,],
+         annotation_names_row = FALSE, annotation_names_col = TRUE,
+         scale="row",
+         show_colnames = FALSE,
+         #breaks = seq(-3,3, length.out = 101),
+         color=colorRampPalette(c("#FF00ff", "#000000", "#FFFF00"))(100),
+         cluster_cols = TRUE, cluster_rows = TRUE,
+         annotation_col = meta.data, annotation_colors = col.ann.colors,
+         #cutree_cols = 5,
+         main="Proteasome Genes")
+
+proteasome.score<-list("proteasome"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = proteasome.score, enrich.name = "full.proteasome.score")
+proteasome.subset.score<-list("proteasome.subset"=genes.subset)
+p10.cc<-AddModuleScore(p10.cc, genes.list = proteasome.subset.score, enrich.name = "sub.proteasome.score")
+
+
+VlnPlot(p10.cc, "sub.proteasome.score1", group.by = "combined.burden")
+VlnPlot(p10.cc, "sub.proteasome.score1", group.by = "burden")
+VlnPlot(p10.cc, genes.subset, group.by="burden")
+JoyPlot(p10.cc, genes.subset, group.by = "burden")
+```
+
+##Ubiquitination Genes
+
+```{r ubiquitination_genes}
+#E1 Ubiquitin Activating Enzymes
+genes<-read.delim("E:\\Gene_Lists\\Ubiquitination_E1_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+
+meta.data<-data.frame(row.names = rownames(p10.cc@meta.data))
+meta.data[,1]<-p10.cc@meta.data$named.clusters
+meta.data[,2]<-p10.cc@meta.data$burden
+colnames(meta.data)<-c("Cluster_ID","Type")
+col.ann.colors=list(Cluster_ID=c("Low"= "#f8766d","Low/Int"="#b79f00","Tumor 1"="#00ba38","Tumor 2"="#00bfc4","Tumor 3"="#619cff","High/Tumor"="#f564e3"),Type=c("H"="#f8766d","I"="#7cae00","L"="#00bfc4","T"="#c77cff"))
+
+pheatmap(p10.cc@data[genes,],
+         annotation_names_row = FALSE, annotation_names_col = TRUE,
+         scale="row",
+         show_colnames = FALSE,
+         #breaks = seq(-3,3, length.out = 101),
+         color=colorRampPalette(c("#FF00ff", "#000000", "#FFFF00"))(100),
+         cluster_cols = TRUE, cluster_rows = TRUE,
+         annotation_col = meta.data, annotation_colors = col.ann.colors,
+         #cutree_cols = 5,
+         main="E1 Ubiquitin Genes")
+
+proteasome.score<-list("e1_ubiquitin"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = proteasome.score, enrich.name = "full.e1.score")
+
+VlnPlot(p10.cc, "full.e1.score1", group.by = "combined.burden")
+VlnPlot(p10.cc, "full.e1.score1", group.by = "burden")
+VlnPlot(p10.cc, "full.e1.score1", group.by = "named.clusters")
+VlnPlot(p10.cc, genes, group.by="burden")
+
+#E2 Ubiquitin Conjugating Enzymes
+genes<-read.delim("E:\\Gene_Lists\\Ubiquitination_E2_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+
+meta.data<-data.frame(row.names = rownames(p10.cc@meta.data))
+meta.data[,1]<-p10.cc@meta.data$named.clusters
+meta.data[,2]<-p10.cc@meta.data$burden
+colnames(meta.data)<-c("Cluster_ID","Type")
+col.ann.colors=list(Cluster_ID=c("Low"= "#f8766d","Low/Int"="#b79f00","Tumor 1"="#00ba38","Tumor 2"="#00bfc4","Tumor 3"="#619cff","High/Tumor"="#f564e3"),Type=c("H"="#f8766d","I"="#7cae00","L"="#00bfc4","T"="#c77cff"))
+
+pheatmap(p10.cc@data[genes,],
+         annotation_names_row = FALSE, annotation_names_col = TRUE,
+         scale="row",
+         show_colnames = FALSE,
+         #breaks = seq(-3,3, length.out = 101),
+         color=colorRampPalette(c("#FF00ff", "#000000", "#FFFF00"))(100),
+         cluster_cols = TRUE, cluster_rows = TRUE,
+         annotation_col = meta.data, annotation_colors = col.ann.colors,
+         #cutree_cols = 5,
+         main="E2 Ubiquitin Genes")
+
+proteasome.score<-list("e2_ubiquitin"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = proteasome.score, enrich.name = "full.e2.score")
+
+VlnPlot(p10.cc, "full.e2.score1", group.by = "combined.burden")
+VlnPlot(p10.cc, "full.e2.score1", group.by = "burden")
+VlnPlot(p10.cc, "full.e2.score1", group.by = "named.clusters")
+VlnPlot(p10.cc, genes, group.by="burden")
+
+#E3 Ubiquitin Ligating Enzymes
+genes<-read.delim("E:\\Gene_Lists\\Ubiquitination_E3_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+
+meta.data<-data.frame(row.names = rownames(p10.cc@meta.data))
+meta.data[,1]<-p10.cc@meta.data$named.clusters
+meta.data[,2]<-p10.cc@meta.data$burden
+colnames(meta.data)<-c("Cluster_ID","Type")
+col.ann.colors=list(Cluster_ID=c("Low"= "#f8766d","Low/Int"="#b79f00","Tumor 1"="#00ba38","Tumor 2"="#00bfc4","Tumor 3"="#619cff","High/Tumor"="#f564e3"),Type=c("H"="#f8766d","I"="#7cae00","L"="#00bfc4","T"="#c77cff"))
+
+pheatmap(p10.cc@data[genes,],
+         annotation_names_row = FALSE, annotation_names_col = TRUE,
+         scale="row",
+         show_colnames = FALSE,
+         #breaks = seq(-3,3, length.out = 101),
+         color=colorRampPalette(c("#FF00ff", "#000000", "#FFFF00"))(100),
+         cluster_cols = TRUE, cluster_rows = TRUE,
+         annotation_col = meta.data, annotation_colors = col.ann.colors,
+         #cutree_cols = 5,
+         main="E3 Ubiquitin Genes")
+
+proteasome.score<-list("e3_ubiquitin"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = proteasome.score, enrich.name = "full.e3.score")
+
+VlnPlot(p10.cc, "full.e3.score1", group.by = "combined.burden")
+VlnPlot(p10.cc, "full.e3.score1", group.by = "burden")
+VlnPlot(p10.cc, "full.e3.score1", group.by = "named.clusters")
+VlnPlot(p10.cc, genes, group.by="burden")
+```
+
+##Oxidative Phosphorylation Genes
+
+```{r oxphos_genes_load}
+genes<-read.delim("E:\\Gene_Lists\\Oxidative_Phosphorylation_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r oxphos_genes_heatmap}
+meta.data<-data.frame(row.names = rownames(p10.cc@meta.data))
+meta.data[,1]<-p10.cc@meta.data$Paper_ID
+meta.data[,2]<-p10.cc@meta.data$burden
+colnames(meta.data)<-c("Cluster_ID","Type")
+col.ann.colors=list(Cluster_ID=c("Low"= "#f8766d","Low/Int"="#b79f00","Tumor 1"="#00ba38","Tumor 2"="#00bfc4","Tumor 3"="#619cff","High/Tumor"="#f564e3"),Type=c("H"="#f8766d","I"="#7cae00","L"="#00bfc4","T"="#c77cff"))
+
+pheatmap(p10.cc@data[genes.subset,],
+         annotation_names_row = FALSE, annotation_names_col = TRUE,
+         scale="row",
+         show_colnames = FALSE,
+         #breaks = seq(-3,3, length.out = 101),
+         color=colorRampPalette(c("#FF00ff", "#000000", "#FFFF00"))(100),
+         cluster_cols = TRUE, cluster_rows = TRUE,
+         annotation_col = meta.data, annotation_colors = col.ann.colors,
+         #cutree_cols = 5,
+         main="Proteasome Genes")
+```
+```{r oxphos_genes_score}
+oxphos.score<-list("oxphos"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = oxphos.score, enrich.name = "OXidative_Phophorylation_Score")
+VlnPlot(p10.cc, "OXidative_Phophorylation_Score1", group.by = "Paper_ID")
+```
+```{r oxphos_genes_bargraph}
+oxi_bar_up_df<-FetchData(p10.cc, c(genes))
+oxi_bar_up_df<-as.data.frame(oxi_bar_up_df)
+oxi_bar_up_df<-cbind(oxi_bar_up_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+oxi_bar_up_avg_df<-aggregate(. ~ Paper_ID,oxi_bar_up_df,function(x) c(mean = mean(x), sd = sd(x)))
+oxi_bar_up_avg_df<-do.call("data.frame",oxi_bar_up_avg_df)
+
+oxi_bar_up_avg_df_sd<-melt(oxi_bar_up_avg_df[,c(seq(1, by = 2, len = 10))], id="Paper_ID")
+oxi_bar_up_avg_df_means<-melt(oxi_bar_up_avg_df[,c(1,seq(2, by = 2, len = 9))], id="Paper_ID")
+colnames(oxi_bar_up_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+oxi_bar_up_avg_df<-merge(oxi_bar_up_avg_df_means,oxi_bar_up_avg_df_sd)
+colnames(oxi_bar_up_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+oxi_bar_up_avg_df_meansd<-cbind(oxi_bar_up_avg_df_means,oxi_bar_up_avg_df_sd[,2:3])
+
+ggplot(oxi_bar_up_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")
+```
+```{r oxphos_genes_logfc}
+sig_genes <- FetchData(p10.cc, c(genes_gly,genes_ox,"Paper_ID"))
+
+sig_genes$Paper_ID[which(sig_genes$Paper_ID %in% c("C1","C4","C5","C6"))]<-"C1"
+
+test <- group_by(sig_genes,Paper_ID) %>% summarise_at(.vars = c(genes),.funs = c(mean="mean"))
+
+test <- data.frame(test)
+rownames(test) <- test[,1]
+test <- test[,-1]
+
+test_FC <- test[c(2,3),]
+test_FC[1,] <- log2(test[2,]) - log2(test[1,])
+test_FC[2,] <- log2(test[3,]) - log2(test[1,])
+
+
+test_FC<-cbind(rownames(test_FC),test_FC)
+
+test_FC<-melt(test_FC)
+as.character(strsplit(as.character(test_FC$variable),"_mean"))->genes.names
+test_FC$variable<-genes.names
+emt_type<-list()
+emt_type[which(test_FC$variable %in% c(genes_down,"EPCAM"))]<-"down"
+emt_type[which(test_FC$variable %in% c(genes_up,"ZEB1"))]<-"up"
+emt_type<-as.character(emt_type)
+test_FC<-cbind(test_FC,emt_type)
+
+test_FC<-test_FC[order(test_FC$value, decreasing = T),]
+test_FC$variable <- factor(test_FC$variable, levels = test_FC$variable)
+```
+
+##Glycolysis Genes
+
+```{r glycolysis_genes_load}
+genes<-read.delim("E:\\Gene_Lists\\Glycolysis_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r glycolysis_genes_score}
+glyco.score<-list("glyco"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = glyco.score, enrich.name = "Glycolysis_Score")
+VlnPlot(p10.cc, "Glycolysis_Score1", group.by = "Paper_ID")
+```
+```{r glycolysis_genes_bargraph}
+gly_bar_up_df<-FetchData(p10.cc, c(genes))
+gly_bar_up_df<-as.data.frame(gly_bar_up_df)
+gly_bar_up_df<-cbind(gly_bar_up_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+gly_bar_up_avg_df<-aggregate(. ~ Paper_ID,gly_bar_up_df,function(x) c(mean = mean(x), sd = sd(x)))
+gly_bar_up_avg_df<-do.call("data.frame",gly_bar_up_avg_df)
+
+gly_bar_up_avg_df_sd<-melt(gly_bar_up_avg_df[,c(seq(1, by = 2, len = 18))], id="Paper_ID")
+gly_bar_up_avg_df_means<-melt(gly_bar_up_avg_df[,c(1,seq(2, by = 2, len = 17))], id="Paper_ID")
+colnames(gly_bar_up_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+gly_bar_up_avg_df<-merge(gly_bar_up_avg_df_means,gly_bar_up_avg_df_sd)
+colnames(gly_bar_up_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+gly_bar_up_avg_df_meansd<-cbind(gly_bar_up_avg_df_means,gly_bar_up_avg_df_sd[,2:3])
+
+ggplot(gly_bar_up_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")
+```
+```{r glycolysis_genes_mets_barplot}
+met_bar_fig_df<-FetchData(p10.cc, c("ALDOA","PFKL","PGM1","NDUFS6","NDUFS8","ATP5D","TIMP3","CTGF","ECM1"))
+met_bar_fig_df<-as.data.frame(met_bar_fig_df)
+met_bar_fig_df<-cbind(met_bar_fig_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+met_bar_fig_avg_df<-aggregate(. ~ Paper_ID,met_bar_fig_df,function(x) c(mean = mean(x), sd = sd(x)))
+met_bar_fig_avg_df<-do.call("data.frame",met_bar_fig_avg_df)
+
+met_bar_fig_avg_df_sd<-melt(met_bar_fig_avg_df[,c(seq(1, by = 2, len = 10))], id="Paper_ID")
+met_bar_fig_avg_df_means<-melt(met_bar_fig_avg_df[,c(1,seq(2, by = 2, len = 9))], id="Paper_ID")
+colnames(met_bar_fig_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+met_bar_fig_avg_df<-merge(met_bar_fig_avg_df_means,met_bar_fig_avg_df_sd)
+colnames(met_bar_fig_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+met_bar_fig_avg_df_meansd<-cbind(met_bar_fig_avg_df_means,met_bar_fig_avg_df_sd[,2:3])
+
+a<-ggplot(met_bar_fig_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  facet_wrap(~gene.mean,scales="free", ncol=9)+
+  theme(legend.position="none")
+```
+```{r glycolysis_genes_logfc}
+sig_genes <- FetchData(p10.cc, c(genes_gly,genes_ox,"Paper_ID"))
+
+sig_genes$Paper_ID[which(sig_genes$Paper_ID %in% c("C1","C4","C5","C6"))]<-"C1"
+sig_genes$Paper_ID[which(sig_genes$Paper_ID %in% c("C2","C3"))]<-"C2"
+
+
+test <- group_by(sig_genes,Paper_ID) %>% summarise_at(.vars = c(genes_gly,genes_ox),.funs = c(mean="mean"))
+
+test <- data.frame(test)
+rownames(test) <- test[,1]
+test <- test[,-1]
+
+test_FC <- test[c(2),]
+test_FC[1,] <- log2(test[2,]) - log2(test[1,])
+
+
+test_FC<-cbind(rownames(test_FC),test_FC)
+
+test_FC<-melt(test_FC)
+as.character(strsplit(as.character(test_FC$variable),"_mean"))->genes.names
+test_FC$variable<-genes.names
+emt_type<-list()
+emt_type[which(test_FC$variable %in% c(genes_gly))]<-"gly"
+emt_type[which(test_FC$variable %in% c(genes_ox))]<-"ox"
+emt_type<-as.character(emt_type)
+test_FC<-cbind(test_FC,emt_type)
+
+test_FC<-test_FC[order(test_FC$value, decreasing = T),]
+test_FC$variable <- factor(test_FC$variable, levels = test_FC$variable)
+
+ggplot(test_FC[1:25,], aes(factor(variable), value, fill=emt_type)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))+
+  scale_y_continuous(limits=c(-2.5,2),breaks=c(-4,-2, 0,2))
+```
+
+##EMT Genes
+
+```{r emt_genes_up_load}
+genes<-read.delim("E:\\Gene_Lists\\EMT_Upregulated_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+genes_up<-genes
+```
+```{r emt_genes_up_score}
+emt.up.score<-list("emt_up"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = emt.up.score, enrich.name = "EMT_Upregulated_Score")
+VlnPlot(p10.cc, "EMT_Upregulated_Score1", group.by = "Paper_ID")
+```
+```{r emt_genes_up_bargraph}
+emt_bar_up_df<-FetchData(p10.cc, c(genes,"ZEB1"))
+emt_bar_up_df<-as.data.frame(emt_bar_up_df)
+emt_bar_up_df<-cbind(emt_bar_up_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+emt_bar_up_avg_df<-aggregate(. ~ Paper_ID,emt_bar_up_df,function(x) c(mean = mean(x), sd = sd(x)))
+emt_bar_up_avg_df<-do.call("data.frame",emt_bar_up_avg_df)
+
+emt_bar_up_avg_df_sd<-melt(emt_bar_up_avg_df[,c(seq(1, by = 2, len = 33))], id="Paper_ID")
+emt_bar_up_avg_df_means<-melt(emt_bar_up_avg_df[,c(1,seq(2, by = 2, len = 32))], id="Paper_ID")
+colnames(emt_bar_up_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+emt_bar_up_avg_df<-merge(emt_bar_up_avg_df_means,emt_bar_up_avg_df_sd)
+colnames(emt_bar_up_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+emt_bar_up_avg_df_meansd<-cbind(emt_bar_up_avg_df_means,emt_bar_up_avg_df_sd[,2:3])
+
+ggplot(emt_bar_up_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  scale_y_continuous(breaks=c(0,0.25,0.5,0.75,1,1.25,1.5,1.75,2,2.25,2.5,2.75,3))
+```
+```{r emt_genes_down_load}
+genes<-read.delim("E:\\Gene_Lists\\EMT_Downregulated_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+genes_down<-genes
+```
+```{r emt_genes_down_bargraph}
+emt_bar_down_df<-FetchData(p10.cc, c(genes,"EPCAM"))
+emt_bar_down_df<-as.data.frame(emt_bar_down_df)
+emt_bar_down_df<-cbind(emt_bar_down_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+emt_bar_down_avg_df<-aggregate(. ~ Paper_ID,emt_bar_down_df,function(x) c(mean = mean(x), sd = sd(x)))
+emt_bar_down_avg_df<-do.call("data.frame",emt_bar_down_avg_df)
+
+emt_bar_down_avg_df_sd<-melt(emt_bar_down_avg_df[,c(seq(1, by = 2, len = 14))], id="Paper_ID")
+emt_bar_down_avg_df_means<-melt(emt_bar_down_avg_df[,c(1,seq(2, by = 2, len = 13))], id="Paper_ID")
+colnames(emt_bar_down_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+emt_bar_down_avg_df<-merge(emt_bar_down_avg_df_means,emt_bar_down_avg_df_sd)
+colnames(emt_bar_down_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+emt_bar_down_avg_df_meansd<-cbind(emt_bar_down_avg_df_means,emt_bar_down_avg_df_sd[,2:3])
+
+ggplot(emt_bar_down_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  scale_y_continuous(breaks=c(0,0.25,0.5,0.75,1,1.25,1.5,1.75,2,2.25,2.5,2.75,3))
+```
+```{r emt_genes_down_score}
+emt.down.score<-list("emt_down"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = emt.down.score, enrich.name = "EMT_Downregulated_Score")
+VlnPlot(p10.cc, "EMT_Downregulated_Score1", group.by = "Paper_ID")
+```
+```{r emt_genes_log.fc}
+sig_genes <- FetchData(p10.cc, c(genes_up,genes_down,"ZEB1","EPCAM","Paper_ID"))
+
+sig_genes$Paper_ID[which(sig_genes$Paper_ID %in% c("C1","C2","C3","C5","C6"))]<-"C1"
+
+test <- group_by(sig_genes,Paper_ID) %>% summarise_at(.vars = c(genes_up,genes_down,"ZEB1","EPCAM"),.funs = c(mean="mean"))
+
+test <- data.frame(test)
+rownames(test) <- test[,1]
+test <- test[,-1]
+
+test_FC <- test[2,]
+test_FC[1,] <- log2(test[2,]) - log2(test[1,])
+
+test_FC<-cbind(rownames(test_FC),test_FC)
+
+test_FC<-melt(test_FC)
+as.character(strsplit(as.character(test_FC$variable),"_mean"))->genes.names
+test_FC$variable<-genes.names
+emt_type<-list()
+emt_type[which(test_FC$variable %in% c(genes_down,"EPCAM"))]<-"down"
+emt_type[which(test_FC$variable %in% c(genes_up,"ZEB1"))]<-"up"
+emt_type<-as.character(emt_type)
+test_FC<-cbind(test_FC,emt_type)
+
+test_FC<-test_FC[order(test_FC$value, decreasing = T),]
+test_FC$variable <- factor(test_FC$variable, levels = test_FC$variable)
+
+test_FC_plot<-test_FC[which(test_FC$variable %in% c("MMP3_mean","ZEB1_mean","TCF4_mean","SNAI2_mean","BMP1_mean","EPCAM_mean","CDH1_mean","KRT19_mean","DSP_mean","FGFBP1_mean","WNT5A_mean","WNT5B_mean")),]
+
+ggplot(test_FC_plot, aes(factor(variable), value)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))+
+  scale_y_continuous(limits=c(-2,5),breaks=c(-2,-1,0,1,2,3,4,5))
+
+ggplot(test_FC, aes(factor(variable), value, fill=emt_type)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))+
+  scale_y_continuous(limits=c(-2,5),breaks=c(-2,0,2,4))
+```
+
+##Drug Targettable Genes
+
+```{r drug_target_genes_load}
+genes1<-read.delim("E:\\Gene_Lists\\HCI010_Node7_DrugTargets.txt", header=T)
+genes2<-read.delim("E:\\Gene_Lists\\HCI010_Node7_Progression_DrugTargets.txt", header=T)
+
+genes<-rbind(genes1,genes2)
+
+genes<-read.delim("E:\\Gene_Lists\\Drug_Targets.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r drug_target_genes_heatmap}
+meta.data<-data.frame(row.names = rownames(p10.cc@meta.data))
+meta.data[,1]<-p10.cc@meta.data$Paper_ID
+meta.data[,2]<-p10.cc@meta.data$burden
+colnames(meta.data)<-c("Cluster_ID","Type")
+col.ann.colors=list(Cluster_ID=c("C1"= "#f3766e","C2"="#b6a031","C3"="#2ab34b","C4"="#1cbdc2","C5"="#7094cd","C6"="#cc72ae"),Type=c("H"="#f3776e","I"="#f3776e","L"="#f3776e","T"="#1cbdc2"))
+
+
+paletteLength <- 50
+myColor <- colorRampPalette(c("#FF00ff", "#000000", "#FFFF00"))(paletteLength)
+
+breaks = c(seq(0, 5, length.out = 101),seq(5.01, 10, length.out = 101))
+breaks2 <- breaks
+
+breaks2[length(breaks)] <- max(max(p10.cc@data[genes,]),max(breaks))
+breaks2[1] <- min(min(p10.cc@data[genes,]),min(breaks))
+
+pheatmap(p10.cc@data[genes,],
+         annotation_names_row = FALSE, annotation_names_col = TRUE,
+         scale="row",
+         show_colnames = FALSE,
+         #breaks = seq(-3,3, length.out = 101),
+         color=colorRampPalette(c("#FF00ff","black","#FFFF00"))(length(c(-11,seq(-3,3,by=0.05),11))),
+         breaks = c(-11,seq(-3,3,by=0.05),11),
+         #color=colorRampPalette(c(, "#000000", ))(100),
+         cluster_cols = TRUE, cluster_rows = TRUE,
+         annotation_col = meta.data, annotation_colors = col.ann.colors)
+         #cutree_cols = 5,
+```
+
+##ECM Genes
+
+```{r ecm_genes_load}
+genes<-read.delim("E:\\Gene_Lists\\ECM_Genes.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r ecm_genes_score}
+ecm.score<-list("ecm"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = ecm.score, enrich.name = "ECM_Score")
+VlnPlot(p10.cc, "ECM_Score1", group.by = "Paper_ID")
+```
+```{r ecm_genes_bargraph}
+ecm_bar_up_df<-FetchData(p10.cc, c(genes))
+ecm_bar_up_df<-as.data.frame(ecm_bar_up_df)
+ecm_bar_up_df<-cbind(ecm_bar_up_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+ecm_bar_up_avg_df<-aggregate(. ~ Paper_ID,ecm_bar_up_df,function(x) c(mean = mean(x), sd = sd(x)))
+ecm_bar_up_avg_df<-do.call("data.frame",ecm_bar_up_avg_df)
+
+ecm_bar_up_avg_df_sd<-melt(ecm_bar_up_avg_df[,c(seq(1, by = 2, len = 39))], id="Paper_ID")
+ecm_bar_up_avg_df_means<-melt(ecm_bar_up_avg_df[,c(1,seq(2, by = 2, len = 38))], id="Paper_ID")
+colnames(ecm_bar_up_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+ecm_bar_up_avg_df<-merge(ecm_bar_up_avg_df_means,ecm_bar_up_avg_df_sd)
+colnames(ecm_bar_up_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+ecm_bar_up_avg_df_meansd<-cbind(ecm_bar_up_avg_df_means,ecm_bar_up_avg_df_sd[,2:3])
+
+ggplot(ecm_bar_up_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")
+```
+```{r ecm_genes_logfc}
+ecm_bar_fig_df<-FetchData(p10.cc, c("COL1A1","COL4A2","COL8A1","LAMB1","SPARC","TIMP1","TIMP3","CTGF","ECM1"))
+ecm_bar_fig_df<-as.data.frame(ecm_bar_fig_df)
+ecm_bar_fig_df<-cbind(ecm_bar_fig_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+ecm_bar_fig_avg_df<-aggregate(. ~ Paper_ID,ecm_bar_fig_df,function(x) c(mean = mean(x), sd = sd(x)))
+ecm_bar_fig_avg_df<-do.call("data.frame",ecm_bar_fig_avg_df)
+
+ecm_bar_fig_avg_df_sd<-melt(ecm_bar_fig_avg_df[,c(seq(1, by = 2, len = 10))], id="Paper_ID")
+ecm_bar_fig_avg_df_means<-melt(ecm_bar_fig_avg_df[,c(1,seq(2, by = 2, len = 9))], id="Paper_ID")
+colnames(ecm_bar_fig_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+ecm_bar_fig_avg_df<-merge(ecm_bar_fig_avg_df_means,ecm_bar_fig_avg_df_sd)
+colnames(ecm_bar_fig_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+ecm_bar_fig_avg_df_meansd<-cbind(ecm_bar_fig_avg_df_means,ecm_bar_fig_avg_df_sd[,2:3])
+
+c<-ggplot(ecm_bar_fig_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  facet_wrap(~gene.mean,scales="free", ncol=9)+
+  theme(legend.position="none")
+```
+
+##ECM and EMT Correlation
+
+```{r ecm_emt_corr}
+good.gene.plot<-function(object, feature.plot.1, feature.plot.2, idents.use=NULL, group.by.var = "ident")
+{
+  double.pos.plotting.matrix<-FetchData(object, vars.all = c(feature.plot.1,feature.plot.2,group.by.var))
+  colnames(double.pos.plotting.matrix)<-c(feature.plot.1,feature.plot.2,"Identity")
+  if(is.null(x = idents.use))
+  {
+    idents.use=unique(double.pos.plotting.matrix$Identity)
+  } 
+  else 
+  {
+    double.pos.plotting.matrix<-double.pos.plotting.matrix[double.pos.plotting.matrix$Identity %in% idents.use,]
+  }
+  #gene.cor <- round(x = cor(x = double.pos.plotting.matrix[,feature.plot.1], y = double.pos.plotting.matrix[,feature.plot.2]), digits = 2)
+  #gene.cor<-sapply(split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3]), cor)
+  split.mats<-split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3])
+  gene.cor<-list()
+  for(i in 1:length(split.mats))
+  {
+    gene.cor[i]<-paste(names(split.mats)[i],cor(split.mats[[i]][,1],split.mats[[i]][,2]))
+  }
+  p<-ggplot(double.pos.plotting.matrix,aes(x=get(feature.plot.1),y=get(feature.plot.2)))
+  q <- p + geom_point(aes(color = Identity),size=0.1) + facet_wrap(~Identity) + labs(x=feature.plot.1, y = feature.plot.2)
+  return(list(q,gene.cor))
+}
+
+good.gene.plot.nofacet<-function(object, feature.plot.1, feature.plot.2, idents.use=NULL, group.by.var = "ident", size.use=1)
+{
+  double.pos.plotting.matrix<-FetchData(object, vars.all = c(feature.plot.1,feature.plot.2,group.by.var))
+  colnames(double.pos.plotting.matrix)<-c(feature.plot.1,feature.plot.2,"Identity")
+  if(is.null(x = idents.use))
+  {
+    idents.use=unique(double.pos.plotting.matrix$Identity)
+  } 
+  else 
+  {
+    double.pos.plotting.matrix<-double.pos.plotting.matrix[double.pos.plotting.matrix$Identity %in% idents.use,]
+  }
+  #gene.cor <- round(x = cor(x = double.pos.plotting.matrix[,feature.plot.1], y = double.pos.plotting.matrix[,feature.plot.2]), digits = 2)
+  #gene.cor<-sapply(split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3]), cor)
+  split.mats<-split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3])
+  gene.cor<-list()
+  for(i in 1:length(split.mats))
+  {
+    gene.cor[i]<-paste(names(split.mats)[i],cor(split.mats[[i]][,1],split.mats[[i]][,2]))
+  }
+  p<-ggplot(double.pos.plotting.matrix,aes(x=get(feature.plot.1),y=get(feature.plot.2)))
+  q <- p + geom_point(aes(color = Identity),size=size.use) + labs(x=feature.plot.1, y = feature.plot.2)
+  return(list(q,gene.cor))
+}
+
+good.gene.plot.nofacet(p10.cc, "EMT_Upregulated_Score1","ECM_Score1", size.use = 3)
+```
+
+##NK Cell Ligands
+
+```{r nk_genes_activating_load}
+genes<-read.delim("E:\\Gene_Lists\\NK_Cell_Activating_Ligands.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes.act<-genes[keep.genes]
+```
+```{r nk_genes_activating_bargraph}
+nkact_bar_up_df<-FetchData(p10.cc, c(genes.act))
+nkact_bar_up_df<-as.data.frame(nkact_bar_up_df)
+nkact_bar_up_df<-cbind(nkact_bar_up_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+nkact_bar_up_avg_df<-aggregate(. ~ Paper_ID,nkact_bar_up_df,function(x) c(mean = mean(x), sd = sd(x)))
+nkact_bar_up_avg_df<-do.call("data.frame",nkact_bar_up_avg_df)
+nkact_bar_up_avg_df_sd<-melt(nkact_bar_up_avg_df[,c(seq(1, by = 2, len = 19))], id="Paper_ID")
+nkact_bar_up_avg_df_means<-melt(nkact_bar_up_avg_df[,c(1,seq(2, by = 2, len = 18))], id="Paper_ID")
+colnames(nkact_bar_up_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+nkact_bar_up_avg_df<-merge(nkact_bar_up_avg_df_means,nkact_bar_up_avg_df_sd)
+colnames(nkact_bar_up_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+nkact_bar_up_avg_df_meansd<-cbind(nkact_bar_up_avg_df_means,nkact_bar_up_avg_df_sd[,2:3])
+
+as.character(strsplit(as.character(nkact_bar_up_avg_df_meansd$gene.mean),".mean"))->genes.act.names
+nkact_bar_up_avg_df_meansd$gene.mean<-genes.act.names
+
+ggplot(nkact_bar_up_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")
+```
+```{r nk_genes_inhibitory_load}
+genes<-read.delim("E:\\Gene_Lists\\NK_Cell_Inhibitory_Ligands.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes.inh<-genes[keep.genes]
+```
+```{r nk_genes_inhibitory_bargraph}
+nkinh_bar_up_df<-FetchData(p10.cc, c(genes.inh))
+nkinh_bar_up_df<-as.data.frame(nkinh_bar_up_df)
+nkinh_bar_up_df<-cbind(nkinh_bar_up_df,"Paper_ID"=p10.cc@meta.data$Paper_ID)
+nkinh_bar_up_avg_df<-aggregate(. ~ Paper_ID,nkinh_bar_up_df,function(x) c(mean = mean(x), sd = sd(x)))
+nkinh_bar_up_avg_df<-do.call("data.frame",nkinh_bar_up_avg_df)
+nkinh_bar_up_avg_df_sd<-melt(nkinh_bar_up_avg_df[,c(seq(1, by = 2, len = 7))], id="Paper_ID")
+nkinh_bar_up_avg_df_means<-melt(nkinh_bar_up_avg_df[,c(1,seq(2, by = 2, len = 6))], id="Paper_ID")
+colnames(nkinh_bar_up_avg_df_means)<-c("Paper_ID","gene.mean","mean.value")
+nkinh_bar_up_avg_df<-merge(nkinh_bar_up_avg_df_means,nkinh_bar_up_avg_df_sd)
+colnames(nkinh_bar_up_avg_df_sd)<-c("Paper_ID","gene.sd","sd.value")
+nkinh_bar_up_avg_df_meansd<-cbind(nkinh_bar_up_avg_df_means,nkinh_bar_up_avg_df_sd[,2:3])
+
+as.character(strsplit(as.character(nkinh_bar_up_avg_df_meansd$gene.mean),".mean"))->genes.inh.names
+nkinh_bar_up_avg_df_meansd$gene.mean<-genes.inh.names
+
+ggplot(nkinh_bar_up_avg_df_meansd, aes(factor(gene.mean), mean.value, fill = Paper_ID)) + 
+  geom_bar(stat="identity", position = "dodge")
+```
+```{r nk_genes_combined_logfc}
+genes<-c(genes.act, genes.inh)
+genes<-unique(genes)
+mets<-which(p10.cc@meta.data$burden %in% c("H","I","L"))
+sig_genes <- FetchData(p10.cc, c(genes,"Paper_ID"), cells.use = rownames(p10.cc@meta.data)[mets])
+
+sig_genes$Paper_ID[which(sig_genes$Paper_ID %in% c("C2","C3"))]<-"C2"
+
+
+test <- group_by(sig_genes,Paper_ID) %>% summarise_at(.vars = c(genes),.funs = c(mean="mean"))
+
+test <- data.frame(test)
+rownames(test) <- test[,1]
+test <- test[,-1]
+
+test_FC <- test[c(1),]
+test_FC[1,] <- log2(test[1,]) - log2(test[2,])
+
+
+test_FC<-cbind(rownames(test_FC),test_FC)
+
+test_FC<-melt(test_FC)
+as.character(strsplit(as.character(test_FC$variable),"_mean"))->genes.names
+test_FC$variable<-genes.names
+emt_type<-as.character(test_FC$variable)
+emt_type <- gsub("[.]","-",emt_type)
+emt_type[which(emt_type %in% genes.act[which(genes.act %in% genes.inh)])] <- "Both"
+emt_type[which(emt_type %in% c(genes.act))]<-"Activating"
+emt_type[which(emt_type %in% c(genes.inh))]<-"Inhibitory"
+#emt_type<-as.character(emt_type)
+test_FC<-cbind(test_FC,emt_type)
+
+test_FC<-test_FC[order(test_FC$value, decreasing = T),]
+test_FC$variable <- factor(test_FC$variable, levels = test_FC$variable)
+
+ggplot(test_FC, aes(factor(variable), value, fill=emt_type)) + 
+  geom_bar(stat="identity", position = "dodge")+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))+
+  scale_y_continuous(limits=c(-2,2),breaks=c(-2,-1,0,1,2))
+```
+
+##Immunology Genes
+
+```{r immunlogy_genes_load}
+genes<-read.delim("E:\\Gene_Lists\\Immunology_Terms.txt", header=T)
+keep.genes<-which(genes$Gene %in% rownames(p10.cc@data))
+genes<-genes[keep.genes,]
+```
+```{r immunology_genes_score}
+immunology_scores<-function(seurat.obj, gene.list){
+for(i in 2:ncol(gene.list)){
+  colnames(gene.list[2:ncol(gene.list)])[i]->name
+  temp<-list(name = as.character(gene.list$Gene[which(gene.list[i]=="+")]))
+  seurat.obj<-AddModuleScore(seurat.obj, genes.list =  temp, enrich.name = name)
+  return(seurat.obj)
+  }
+}
+
+VlnPlot(p10.cc.tums, c(colnames(p10.cc.tums@meta.data[15:ncol(p10.cc.tums@meta.data)])), nCol=8)
+```
+
+##Lehmann et al. Immunomodulatory Up Genes
+
+```{r immunomodulatory_genes_up_load}
+genes<-read.delim("E:\\Gene_Lists\\TNBC_Immunomodulatory_Up.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r immunomodulatory_genes_up_score}
+immuno_up<-list("immuno_up"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = immuno_up, enrich.name = "TNBC_Immunomodulatory_Up")
+VlnPlot(p10.cc, "TNBC_Immunomodulatory_Up1", group.by = "Paper_ID")
+```
+
+##Lehmann et al. Immunomodulatory Down Genes
+
+```{r immunomodulatory_genes_down_load}
+genes<-read.delim("E:\\Gene_Lists\\TNBC_Immunomodulatory_Down.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r immunomodulatory_genes_down_load}
+immuno_down<-list("immuno_down"=genes)
+p10.cc<-AddModuleScore(p10.cc, genes.list = immuno_down, enrich.name = "TNBC_Immunomodulatory_Down")
+VlnPlot(p10.cc, "TNBC_Immunomodulatory_Down1", group.by = "Paper_ID")
+```
+
+##10X Normal Data
+
+```{r 10x_genes_load}
+genes<-read.delim("E:\\Gene_Lists\\Nat_Comm_10X_Combined_Markers.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes<-genes[keep.genes]
+```
+```{r 10x_genes_scores}
+top50.normal <- genes %>% group_by(cluster) %>% top_n(50, p_val)
+
+top50.normal.basal <- subset(top50.normal, cluster=="Basal")
+top50.normal.basal<- list("basal"=as.character(top50.normal.basal$gene))
+keep.basal<-which(top50.normal.basal$basal %in% rownames(p10.cc@data))
+keep.basal<-top50.normal.basal$basal[keep.basal]
+top50.normal.basal<- list("basal"=keep.basal)
+
+top50.normal.basalmyo <- subset(top50.normal, cluster=="Basal_Myoepithelial")
+top50.normal.basalmyo<- list("basalmyo"=as.character(top50.normal.basalmyo$gene))
+keep.basalmyo<-which(top50.normal.basalmyo$basalmyo %in% rownames(p10.cc@data))
+keep.basalmyo<-top50.normal.basalmyo$basalmyo[keep.basalmyo]
+top50.normal.basalmyo<- list("basalmyo"=keep.basalmyo)
+
+top50.normal.luminal1.1 <- subset(top50.normal, cluster=="Luminal_1_1")
+top50.normal.luminal1.1<- list("luminal1.1"=as.character(top50.normal.luminal1.1$gene))
+keep.luminal1.1<-which(top50.normal.luminal1.1$luminal1.1 %in% rownames(p10.cc@data))
+keep.luminal1.1<-top50.normal.luminal1.1$luminal1.1[keep.luminal1.1]
+top50.normal.luminal1.1<- list("luminal1.1"=keep.luminal1.1)
+
+top50.normal.luminal1.2 <- subset(top50.normal, cluster=="Luminal_1_2")
+top50.normal.luminal1.2<- list("luminal1.2"=as.character(top50.normal.luminal1.2$gene))
+keep.luminal1.2<-which(top50.normal.luminal1.2$luminal1.2 %in% rownames(p10.cc@data))
+keep.luminal1.2<-top50.normal.luminal1.2$luminal1.2[keep.luminal1.2]
+top50.normal.luminal1.2<- list("luminal1.2"=keep.luminal1.2)
+
+top50.normal.luminal2 <- subset(top50.normal, cluster=="Luminal_2")
+top50.normal.luminal2<- list("luminal2"=as.character(top50.normal.luminal2$gene))
+keep.luminal2<-which(top50.normal.luminal2$luminal2 %in% rownames(p10.cc@data))
+keep.luminal2<-top50.normal.luminal2$luminal2[keep.luminal2]
+top50.normal.luminal2<- list("luminal2"=keep.luminal2)
+
+top50.normal.unclass <- subset(top50.normal, cluster=="Unclassified")
+top50.normal.unclass<- list("unclass"=as.character(top50.normal.unclass$gene))
+keep.unclass<-which(top50.normal.unclass$unclass %in% rownames(p10.cc@data))
+keep.unclass<-top50.normal.unclass$unclass[keep.unclass]
+top50.normal.unclass<- list("unclass"=keep.unclass)
+
+p10.cc<-AddModuleScore(p10.cc, genes.list=top50.normal.basal, enrich.name = "Normal_Basal_Score_Top50")
+p10.cc<-AddModuleScore(p10.cc, genes.list=top50.normal.basalmyo, enrich.name = "Normal_BasalMyo_Score_Top50")
+p10.cc<-AddModuleScore(p10.cc, genes.list=top50.normal.luminal1.1, enrich.name = "Normal_Luminal1.1_Score_Top50")
+p10.cc<-AddModuleScore(p10.cc, genes.list=top50.normal.luminal1.2, enrich.name = "Normal_Luminal1.2_Score_Top50")
+p10.cc<-AddModuleScore(p10.cc, genes.list=top50.normal.luminal2, enrich.name = "Normal_Luminal2_Score_Top50")
+p10.cc<-AddModuleScore(p10.cc, genes.list=top50.normal.unclass, enrich.name = "Normal_Unclass_Score_Top50")
+
+VlnPlot(p10.cc, c("Normal_Basal_Score_Top501","Normal_BasalMyo_Score_Top501","Normal_Luminal1.1_Score_Top501","Normal_Luminal1.2_Score_Top501","Normal_Luminal2_Score_Top501","Normal_Unclass_Score_Top501"), group.by = "Paper_ID")
+VlnPlot(p10.cc, c("Normal_Basal_Score_Top501","Normal_BasalMyo_Score_Top501","Normal_Luminal1.1_Score_Top501","Normal_Luminal1.2_Score_Top501","Normal_Luminal2_Score_Top501","Normal_Unclass_Score_Top501"), group.by = "class")
+```
+
+##nGene and percent mito tSNE
+
+```{r featureplot_ngene_pctmito}
+FeaturePlot(p10.cc, "nGene", cols.use = c("grey", "red"), no.legend = T, pt.size = 3)
+FeaturePlot(p10.cc, "nGene", cols.use = c("grey", "red"), no.legend = F)
+FeaturePlot(p10.cc, "percent.mito", cols.use = c("grey", "red"), no.legend = T,pt.size = 3)
+FeaturePlot(p10.cc, "percent.mito", cols.use = c("grey", "red"), no.legend = F)
+```
+
+##Markers for Low vs Tum and High
+
+```{r markers_low_tumANDhigh}
+p10.cc<-SetAllIdent(p10.cc, id="burden")
+lowVtumhigh.markers <- FindMarkers(object = p10.cc, ident.1 = "L", ident.2 = c("T", "H"), 
+    min.pct = 0.25)
+write.table(lowVtumhigh.markers,file="E:\\Marker_Lists\\012518_Seurat2.1_UpdatedMarkerGenes\\HCI010_MarkerGenes_5PCs_LowvTumHighCombined_cc.txt", sep="\t", col.names = NA)
+lowVtum.markers <- FindMarkers(object = p10.cc, ident.1 = "L", ident.2 = c("T"), 
+    min.pct = 0.25)
+write.table(lowVtum.markers,file="E:\\Marker_Lists\\012518_Seurat2.1_UpdatedMarkerGenes\\HCI010_MarkerGenes_5PCs_LowvTum_cc.txt", sep="\t", col.names = NA)
+lowVhigh.markers <- FindMarkers(object = p10.cc, ident.1 = "L", ident.2 = c("H"), 
+    min.pct = 0.25)
+write.table(lowVhigh.markers,file="E:\\Marker_Lists\\012518_Seurat2.1_UpdatedMarkerGenes\\HCI010_MarkerGenes_5PCs_LowvHigh_cc.txt", sep="\t", col.names = NA)
+```
+
+##Build Cluster Tree (gene-based)
+
+```{r cluster_tree_gene}
+p10.cc<-BuildClusterTree(p10.cc,genes.use = p10.cc@var.genes)
+p10.cc.node.markers<-FindMarkersNode(p10.cc,7)
+write.table(p10.cc.node.markers,file="E:\\Marker_Lists\\062518_Current_Marker_Genes\\070518_HCI010_NodeMarkers_Node7_GeneBased.txt",sep="\t",col.names=NA)
+```
+
+##Build Cluster Tree (PCA-based)
+
+```{r cluster_tree_pca}
+SetIfNull<-function (x, default) 
+{
+    if (is.null(x = x)) {
+        return(default)
+    }
+    else {
+        return(x)
+    }
+}
+
+WeightedEuclideanDist=function(x,y,w) {
+  v.dist=sum(sqrt(w*(x-y)^2))
+  return(v.dist)
+}
+
+test_AveragePCA<-function (object) 
+{
+    ident.use <- object@ident
+    data.all <- t(GetDimReduction(object = object, reduction.type = "pca", 
+        slot = "cell.embeddings"))
+    for (i in levels(x = ident.use)) {
+        temp.cells <- WhichCells(object = object, ident = i)
+        if (length(x = temp.cells) == 1) {
+            data.temp <- apply(X = data.frame((data.all[,c(temp.cells, 
+                temp.cells)])), MARGIN = 2, FUN = mean)
+        }
+        if (length(x = temp.cells) > 1) {
+            data.temp <- apply(X = data.all[,temp.cells], MARGIN = 2, 
+                FUN = mean)
+        }
+        data.all <- cbind(data.all, data.temp)
+        colnames(x = data.all)[ncol(x = data.all)] <- i
+    }
+    data.all<-data.all[,c((ncol(data.all)-(length(levels(x=ident.use))-1)):ncol(data.all))]
+    return(data.all)
+}
+
+test<-function (object, genes.use = NULL, pcs.use = NULL, SNN.use = NULL, 
+    do.plot = TRUE, do.reorder = FALSE, reorder.numeric = FALSE) 
+{
+    genes.use <- SetIfNull(x = genes.use, default = object@var.genes)
+    ident.names <- as.character(x = unique(x = object@ident))
+    if (!is.null(x = genes.use)) {
+        genes.use <- intersect(x = genes.use, y = rownames(x = object@data))
+        data.avg <- AverageExpression(object = object, genes.use = genes.use)
+        data.dist <- dist(t(x = data.avg[genes.use, ]))
+    }
+    if (!is.null(x = pcs.use)) {
+        data.pca <- test_AveragePCA(object = object)
+        print(data.pca)
+        data.use <- data.pca[pcs.use, ]
+        if (is.null(x = object@dr$pca@sdev)) {
+            data.eigenval <- (object@dr$pca@d)^2
+        }
+        else {
+            data.eigenval <- (object@dr$pca@sdev)^2
+        }
+        data.weights <- (data.eigenval/sum(data.eigenval))[pcs.use]
+        data.weights <- data.weights/sum(data.weights)
+        data.dist <- CustomDistance(my.mat = data.pca[pcs.use, 
+            ], my.function = WeightedEuclideanDist, w = data.weights)
+        #print(data.dist)
+    }
+    if (!is.null(x = SNN.use)) {
+        num.clusters <- length(x = ident.names)
+        data.dist = matrix(data = 0, nrow = num.clusters, ncol = num.clusters)
+        for (i in 1:(num.clusters - 1)) {
+            for (j in (i + 1):num.clusters) {
+                subSNN <- SNN.use[match(x = WhichCells(object = object, 
+                  ident = i), table = colnames(x = SNN.use)), 
+                  match(x = WhichCells(object = object, ident = j), 
+                    table = rownames(x = SNN.use))]
+                d <- mean(subSNN)
+                if (is.na(x = d)) {
+                  data.dist[i, j] <- 0
+                }
+                else {
+                  data.dist[i, j] = d
+                }
+            }
+        }
+        diag(x = data.dist) <- 1
+        data.dist <- dist(data.dist)
+    }
+    data.tree <- as.phylo(x = hclust(d = data.dist))
+    object@cluster.tree[[1]] <- data.tree
+    if (do.reorder) {
+        old.ident.order <- sort(x = unique(x = object@ident))
+        data.tree <- object@cluster.tree[[1]]
+        all.desc <- GetDescendants(tree = data.tree, node = (data.tree$Nnode + 
+            2))
+        all.desc <- old.ident.order[all.desc[all.desc <= (data.tree$Nnode + 
+            1)]]
+        object@ident <- factor(x = object@ident, levels = all.desc, 
+            ordered = TRUE)
+        if (reorder.numeric) {
+            object <- SetIdent(object = object, cells.use = object@cell.names, 
+                ident.use = as.integer(x = object@ident))
+            object@meta.data[object@cell.names, "tree.ident"] <- as.integer(x = object@ident)
+        }
+        object <- BuildClusterTree(object = object, genes.use = genes.use, 
+            pcs.use = pcs.use, do.plot = FALSE, do.reorder = FALSE)
+    }
+    if (do.plot) {
+        PlotClusterTree(object)
+    }
+    return(object)
+}
+
+test(object=p10.cc, pcs.use = 1:5)
+```
+
+##Markers for L,I vs H burden
+
+```{r markers_lowANDint_high}
+p10.cc<-SetAllIdent(p10.cc, id="burden")
+lowintvshigh.p10.cc.markers<-FindMarkers(p10.cc, ident.1 = c("L","I"), ident.2 = "H", test.use = "bimod", only.pos = F)
+write.table(lowintvshigh.p10.cc.markers,file="E:\\Marker_Lists\\062518_Current_Marker_Genes\\070518_HCI010_LowInvt_vs_High_Markers.txt",sep="\t",col.names=NA)
+
+p10.cc<-SetAllIdent(p10.cc, id="burden")
+lowintvshightum.p10.cc.markers<-FindMarkers(p10.cc, ident.1 = c("L","I"), ident.2 = c("H","T"), test.use = "bimod", only.pos = F)
+write.table(lowintvshightum.p10.cc.markers,file="E:\\Marker_Lists\\062518_Current_Marker_Genes\\070518_HCI010_LowInvt_vs_HighTum_Markers.txt",sep="\t",col.names=NA)
+```
+
+##Cluster Burden Quantification
+```{r cluster_burden_quant}
+p10.burden.quant<-data.frame(table(p10.cc@meta.data$Paper_ID,p10.cc@meta.data$burden))
+p10.burden.quant[1,1]<-length(which(p10.cc@data["KRT5",]>0))
+p10.burden.quant[2,1]<-length(which(p10.cc@data["KRT14",]>0))
+p10.burden.quant[3,1]<-length(which(p10.cc@data["ERBB2",]>0))
+p10.burden.quant[4,1]<-length(which(p10.cc@data["ESR1",]>0))
+p10.burden.quant[5,1]<-length(which(p10.cc@data["PGR",]>0))
+```
+
+##Markers for L,I vs H burden
+```{r markers_lowANDint_high_by_cluster}
+p10.cc<-SetAllIdent(p10.cc, id="burden")
+lowintvshigh.p10.cc.markers<-FindMarkers(p10.cc, ident.1 = c("L","I"), ident.2 = "H", test.use = "bimod", only.pos = F)
+write.table(lowintvshigh.p10.cc.markers,file="E:\\Marker_Lists\\062518_Current_Marker_Genes\\070518_HCI010_LowInvt_vs_High_Markers.txt",sep="\t",col.names=NA)
+
+p10.cc<-SetAllIdent(p10.cc, id="Paper_ID")
+c2c3vsc1.p10.cc.markers<-FindMarkers(p10.cc, ident.1 = c("C2","C3"), ident.2 = c("C1"), test.use = "bimod", only.pos = F)
+write.table(c2c3vsc1.p10.cc.markers,file="E:\\Marker_Lists\\062518_Current_Marker_Genes\\070518_HCI010_C2C3_vs_C1_Markers.txt",sep="\t",col.names=NA)
+```
+
+##Met Only Analysis
+```{r met_only_seurat_generation}
+p10.cc<-SetAllIdent(p10.cc, id="burden")
+p10.cc.mets<-SubsetData(p10.cc, ident.use = c("H","I","L"))
+p10.cc.mets@meta.data$burden[grep("I",p10.cc.mets@meta.data$burden)]<-"L"
+```
+
+```{r mets_only_dimentionality_reduction_PCA}
+p10.cc.mets <- FindVariableGenes(object = p10.cc.mets, mean.function = ExpMean, dispersion.function = LogVMR, 
+    x.low.cutoff = 0.0125, x.high.cutoff = 3, y.cutoff = 0.5)
+p10.cc.mets <- ScaleData(object = p10.cc.mets, vars.to.regress = c("nGene", "percent.mito"),display.progress = FALSE)
+p10.cc.mets <- RunPCA(object = p10.cc.mets, pc.genes = p10.cc.mets@var.genes, do.print = TRUE, pcs.print = 1:5, 
+    genes.print = 5)
+PCElbowPlot(object = p10.cc.mets,num.pc = 20)
+```
+
+```{r mets_only_dimentionality_reduction_tSNE}
+p10.cc.mets <- FindClusters(object = p10.cc.mets, reduction.type = "pca", dims.use = 1:5, 
+    resolution = 1.0, print.output = 0, save.SNN = TRUE)
+PrintFindClustersParams(object = p10.cc.mets)
+set.seed(1)
+p10.cc.mets <- RunTSNE(object = p10.cc.mets, dims.use = 1:5, do.fast = TRUE)
+h1<-TSNEPlot(p10.cc.mets,do.label = FALSE, group.by="Paper_ID",do.return=TRUE, pt.size = 3, no.legend=T)
+h2<-TSNEPlot(p10.cc.mets,do.label = FALSE, group.by="mouse",do.return=TRUE)
+h3<-TSNEPlot(p10.cc.mets,do.label = FALSE, group.by="tissue",do.return=TRUE)
+h4<-TSNEPlot(p10.cc.mets,do.label = FALSE, group.by="burden",do.return=TRUE)
+plot_grid(h1,h2,h3,h4)
+```
+
+##Met Only Comparison of Cell Cycle and NK Cell Ligand Expression
+
+```{r mets_only_nk_ligand_genes_load}
+genes<-read.delim("E:\\Gene_Lists\\NK_Cell_Activating_Ligands.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes.act<-genes[keep.genes]
+```
+```{r mets_only_nk_ligand_genes_score}
+nkact<-list("NK Activating"=genes.act)
+genes<-read.delim("E:\\Gene_Lists\\NK_Cell_Inhibitory_Ligands.txt", header=T)
+genes<-as.character(genes[,1])
+keep.genes<-which(genes %in% rownames(p10.cc@data))
+genes.inh<-genes[keep.genes]
+nkinh<-list("NK Inhibitory"=genes.inh)
+
+p10.cc.mets<-AddModuleScore(p10.cc.mets, genes.list = nkact, enrich.name = "NK_Activating")
+p10.cc.mets<-AddModuleScore(p10.cc.mets, genes.list = nkinh, enrich.name = "NK_Inhibitory")
+```
+```{r mets_only_nk_ligand_genes_cc_corr}
+good.gene.plot<-function(object, feature.plot.1, feature.plot.2, idents.use=NULL, group.by.var = "ident", size.use=1)
+{
+  double.pos.plotting.matrix<-FetchData(object, vars.all = c(feature.plot.1,feature.plot.2,group.by.var))
+  colnames(double.pos.plotting.matrix)<-c(feature.plot.1,feature.plot.2,"Identity")
+  if(is.null(x = idents.use))
+  {
+    idents.use=unique(double.pos.plotting.matrix$Identity)
+  } 
+  else 
+  {
+    double.pos.plotting.matrix<-double.pos.plotting.matrix[double.pos.plotting.matrix$Identity %in% idents.use,]
+  }
+  #gene.cor <- round(x = cor(x = double.pos.plotting.matrix[,feature.plot.1], y = double.pos.plotting.matrix[,feature.plot.2]), digits = 2)
+  #gene.cor<-sapply(split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3]), cor)
+  split.mats<-split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3])
+  gene.cor<-list()
+  for(i in 1:length(split.mats))
+  {
+    gene.cor[i]<-paste(names(split.mats)[i],cor(split.mats[[i]][,1],split.mats[[i]][,2]))
+  }
+  p<-ggplot(double.pos.plotting.matrix,aes(x=get(feature.plot.1),y=get(feature.plot.2)))
+  q <- p + geom_point(aes(color = Identity),size=size.use) + facet_wrap(~Identity) + labs(x=feature.plot.1, y = feature.plot.2)
+  return(list(q,gene.cor))
+}
+
+good.gene.plot.nofacet<-function(object, feature.plot.1, feature.plot.2, idents.use=NULL, group.by.var = "ident", size.use=1)
+{
+  double.pos.plotting.matrix<-FetchData(object, vars.all = c(feature.plot.1,feature.plot.2,group.by.var))
+  colnames(double.pos.plotting.matrix)<-c(feature.plot.1,feature.plot.2,"Identity")
+  if(is.null(x = idents.use))
+  {
+    idents.use=unique(double.pos.plotting.matrix$Identity)
+  } 
+  else 
+  {
+    double.pos.plotting.matrix<-double.pos.plotting.matrix[double.pos.plotting.matrix$Identity %in% idents.use,]
+  }
+  #gene.cor <- round(x = cor(x = double.pos.plotting.matrix[,feature.plot.1], y = double.pos.plotting.matrix[,feature.plot.2]), digits = 2)
+  #gene.cor<-sapply(split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3]), cor)
+  split.mats<-split(double.pos.plotting.matrix[,1:2], double.pos.plotting.matrix[,3])
+  gene.cor<-list()
+  for(i in 1:length(split.mats))
+  {
+    gene.cor[i]<-paste(names(split.mats)[i],cor(split.mats[[i]][,1],split.mats[[i]][,2]))
+  }
+  p<-ggplot(double.pos.plotting.matrix,aes(x=get(feature.plot.1),y=get(feature.plot.2)))
+  q <- p + geom_point(aes(color = Identity),size=size.use) + labs(x=feature.plot.1, y = feature.plot.2)
+  return(list(q,gene.cor))
+}
+
+good.gene.plot(p10.cc.mets, "NK_Activating1","S.Score", group.by.var = "Paper_ID",size.use = 3)
+
+ki67.exp<-FetchData(p10.cc.mets, "NK_Activating1")
+cc.plot.mat<-cbind.data.frame(p10.cc.mets@meta.data$S.Score, p10.cc.mets@meta.data$G2M.Score, p10.cc.mets@meta.data$named.clusters,ki67.exp)
+colnames(cc.plot.mat)<-c("G1S.Score", "G2M.Score", "Cluster", "NK.Activating.Score")
+#cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=Cluster))+
+cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=NK.Activating.Score))+
+    #scale_color_gradient(low="blue", high="red")+
+#cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=Scaled.KI67))+
+  scale_color_gradient(low="grey", high="red")+
+  geom_point(size=3.0)+
+  geom_vline(xintercept=0)+
+  geom_hline(yintercept=0)
+  #theme(legend.position="none")
+
+ki67.exp<-FetchData(p10.cc.mets, "NK_Inhibitory1")
+cc.plot.mat<-cbind.data.frame(p10.cc.mets@meta.data$S.Score, p10.cc.mets@meta.data$G2M.Score, p10.cc.mets@meta.data$named.clusters,ki67.exp)
+colnames(cc.plot.mat)<-c("G1S.Score", "G2M.Score", "Cluster", "NK.Inhibitory.Score")
+#cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=Cluster))+
+cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=NK.Inhibitory.Score))+
+    #scale_color_gradient(low="blue", high="red")+
+#cc.plot<-ggplot(data = cc.plot.mat, aes(x=G1S.Score, y=G2M.Score, color=Scaled.KI67))+
+  scale_color_gradient(low="grey", high="red")+
+  geom_point(size=4.0)+
+  geom_vline(xintercept=0)+
+  geom_hline(yintercept=0)
+  #theme(legend.position="none")
+```
+
+##Build Cluster Tree (PCA-based) Mets Only
+
+```{r mets_only_cluster_tree_pca}
+SetIfNull<-function (x, default) 
+{
+    if (is.null(x = x)) {
+        return(default)
+    }
+    else {
+        return(x)
+    }
+}
+
+WeightedEuclideanDist=function(x,y,w) {
+  v.dist=sum(sqrt(w*(x-y)^2))
+  return(v.dist)
+}
+
+test_AveragePCA<-function (object) 
+{
+    ident.use <- object@ident
+    data.all <- t(GetDimReduction(object = object, reduction.type = "pca", 
+        slot = "cell.embeddings"))
+    for (i in levels(x = ident.use)) {
+        temp.cells <- WhichCells(object = object, ident = i)
+        if (length(x = temp.cells) == 1) {
+            data.temp <- apply(X = data.frame((data.all[,c(temp.cells, 
+                temp.cells)])), MARGIN = 2, FUN = mean)
+        }
+        if (length(x = temp.cells) > 1) {
+            data.temp <- apply(X = data.all[,temp.cells], MARGIN = 2, 
+                FUN = mean)
+        }
+        data.all <- cbind(data.all, data.temp)
+        colnames(x = data.all)[ncol(x = data.all)] <- i
+    }
+    data.all<-data.all[,c((ncol(data.all)-(length(levels(x=ident.use))-1)):ncol(data.all))]
+    return(data.all)
+}
+
+test<-function (object, genes.use = NULL, pcs.use = NULL, SNN.use = NULL, 
+    do.plot = TRUE, do.reorder = FALSE, reorder.numeric = FALSE) 
+{
+    genes.use <- SetIfNull(x = genes.use, default = object@var.genes)
+    ident.names <- as.character(x = unique(x = object@ident))
+    if (!is.null(x = genes.use)) {
+        genes.use <- intersect(x = genes.use, y = rownames(x = object@data))
+        data.avg <- AverageExpression(object = object, genes.use = genes.use)
+        data.dist <- dist(t(x = data.avg[genes.use, ]))
+    }
+    if (!is.null(x = pcs.use)) {
+        data.pca <- test_AveragePCA(object = object)
+        print(data.pca)
+        data.use <- data.pca[pcs.use, ]
+        if (is.null(x = object@dr$pca@sdev)) {
+            data.eigenval <- (object@dr$pca@d)^2
+        }
+        else {
+            data.eigenval <- (object@dr$pca@sdev)^2
+        }
+        data.weights <- (data.eigenval/sum(data.eigenval))[pcs.use]
+        data.weights <- data.weights/sum(data.weights)
+        data.dist <- CustomDistance(my.mat = data.pca[pcs.use, 
+            ], my.function = WeightedEuclideanDist, w = data.weights)
+        #print(data.dist)
+    }
+    if (!is.null(x = SNN.use)) {
+        num.clusters <- length(x = ident.names)
+        data.dist = matrix(data = 0, nrow = num.clusters, ncol = num.clusters)
+        for (i in 1:(num.clusters - 1)) {
+            for (j in (i + 1):num.clusters) {
+                subSNN <- SNN.use[match(x = WhichCells(object = object, 
+                  ident = i), table = colnames(x = SNN.use)), 
+                  match(x = WhichCells(object = object, ident = j), 
+                    table = rownames(x = SNN.use))]
+                d <- mean(subSNN)
+                if (is.na(x = d)) {
+                  data.dist[i, j] <- 0
+                }
+                else {
+                  data.dist[i, j] = d
+                }
+            }
+        }
+        diag(x = data.dist) <- 1
+        data.dist <- dist(data.dist)
+    }
+    data.tree <- as.phylo(x = hclust(d = data.dist))
+    object@cluster.tree[[1]] <- data.tree
+    if (do.reorder) {
+        old.ident.order <- sort(x = unique(x = object@ident))
+        data.tree <- object@cluster.tree[[1]]
+        all.desc <- GetDescendants(tree = data.tree, node = (data.tree$Nnode + 
+            2))
+        all.desc <- old.ident.order[all.desc[all.desc <= (data.tree$Nnode + 
+            1)]]
+        object@ident <- factor(x = object@ident, levels = all.desc, 
+            ordered = TRUE)
+        if (reorder.numeric) {
+            object <- SetIdent(object = object, cells.use = object@cell.names, 
+                ident.use = as.integer(x = object@ident))
+            object@meta.data[object@cell.names, "tree.ident"] <- as.integer(x = object@ident)
+        }
+        object <- BuildClusterTree(object = object, genes.use = genes.use, 
+            pcs.use = pcs.use, do.plot = FALSE, do.reorder = FALSE)
+    }
+    if (do.plot) {
+        PlotClusterTree(object)
+    }
+    return(object)
+}
+
+p10.cc.mets<-SetAllIdent(p10.cc.mets,id="burden")
+p10.cc.mets<-test(object=p10.cc.mets, pcs.use = 1:5)
+```
